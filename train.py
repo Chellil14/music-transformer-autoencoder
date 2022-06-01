@@ -71,7 +71,7 @@ def get_nll_loss(output_probs, targets):
     return F.nll_loss(torch.log(output_probs).transpose(-2, -1), targets)
 
 
-def do_train(data_dir, prefix, train_dir, configs={}):
+def do_train(data_dir, prefix, train_dir, checkpoint, configs={}):
     data_dir = Path(data_dir)
     train_dir = Path(train_dir)
     train_dir.mkdir(parents=True, exist_ok=True)
@@ -83,16 +83,23 @@ def do_train(data_dir, prefix, train_dir, configs={}):
     epochs = configs.get('epochs', 50000)
     eval_steps = configs.get('eval_steps', 1000)
     lr = configs.get('lr', 0.1)
+    save_optim_state = configs.get('save_optim_state', False)
     melody_combine_method=configs.get('melody_combine_method', 'NONE')
+    restart_training=configs.get('restart_training', True)
 
     # Dataset
     train_dataset = DatasetMusicAE(data_dir, prefix, "train")
     validation_dataset = DatasetMusicAE(data_dir, prefix, "validation")
     test_dataset = DatasetMusicAE(data_dir, prefix, "test")
 
-    train_loader = DataLoader(train_dataset, batch_size)
-    validation_loader = DataLoader(validation_dataset, batch_size)
-    test_loader = DataLoader(test_dataset, batch_size)
+    loader_config = {
+        'num_workers': 1,
+        'prefetch_factor': 100,
+        'pin_memory': True,
+    }
+    train_loader = DataLoader(train_dataset, batch_size, **loader_config)
+    validation_loader = DataLoader(validation_dataset, batch_size, **loader_config)
+    test_loader = DataLoader(test_dataset, batch_size, **loader_config)
 
     # Model
     model = MusicAETransformer(
@@ -115,10 +122,25 @@ def do_train(data_dir, prefix, train_dir, configs={}):
     optimizer = optim.Adam(model.parameters(), lr=0, betas=(0.9, 0.98), eps=1e-9) # NOTE Don't use the default betas
     scheduler = InverseSqrtSchedule(lr, warmup_steps, hidden_size, optimizer)
 
-    # Train Start
-    # TODO add progress bar using tqdm
-    print("Starting training")
+    def _save_model(suffix, epoch):
+        save_dict = {'model': model.state_dict()}
+        if save_optim_state:
+            save_dict['optim'] = optimizer.state_dict()
+            save_dict['epoch'] = epoch
+
+        torch.save(save_dict, train_dir / f'{prefix}-{suffix}.pth')
+
+    # Load checkpoint(if provided)
     epoch = 0
+    if checkpoint:
+        ckpt_dict = torch.load(checkpoint)
+        model.load_state_dict(ckpt_dict['model'])
+        if 'optim' in ckpt_dict and not restart_training:
+            epoch = checkpoint['epoch']
+            optimizer.load_state_dict(ckpt_dict['optim'])
+
+    # Train Start
+    print("Starting training")
     with tqdm(total=epochs) as pbar:
         while epoch < epochs:
             for input_data in train_loader:
@@ -131,6 +153,7 @@ def do_train(data_dir, prefix, train_dir, configs={}):
                 loss.backward()
                 optimizer.step()
                 scheduler.step()
+                epoch += 1
 
                 # result_metrics = metric_set(sample, batch_y)
                 if epoch % eval_steps == 0:
@@ -146,7 +169,6 @@ def do_train(data_dir, prefix, train_dir, configs={}):
                             total_loss += loss.item()
                             total_samples += 1
                     print(f"Epoch: {epoch} Test loss: {total_loss / total_samples}")
-                epoch += 1
                 pbar.update(1)
                 if epoch >= epochs:
                     break
@@ -163,6 +185,8 @@ def get_parser() -> argparse.ArgumentParser:
             help="Dataset file prefix(score2perf problem name in Magenta)")
     parser.add_argument("--train_dir", type=str, required=True,
             help="The directory where the trained model is saved")
+    parser.add_argument("--checkpoint", type=str,
+            help="The checkpoint to resume")
     parser.add_argument("--config_file",
             help="Path to YAML config file")
     parser.add_argument("--configs", dest="configs", default=[], nargs="*",
@@ -202,4 +226,4 @@ if __name__ == "__main__":
         k, v = x.split('=', 1)
         configs[k] = parse_value(v)
 
-    do_train(args.data_dir, args.prefix, args.train_dir, configs)
+    do_train(args.data_dir, args.prefix, args.train_dir, args.checkpoint, configs)
